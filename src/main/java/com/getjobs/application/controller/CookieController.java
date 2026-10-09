@@ -19,7 +19,7 @@ import java.util.*;
 @Slf4j
 @RestController
 @RequestMapping("/api/cookie")
-@CrossOrigin(origins = "*")
+@CrossOrigin(origins = {"http://localhost:6866", "http://127.0.0.1:6866", "http://localhost:9527", "http://127.0.0.1:9527"})
 @RequiredArgsConstructor
 public class CookieController {
 

@@ -10,7 +10,7 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 @RestController
-@CrossOrigin(origins = "*")
+@CrossOrigin(origins = {"http://localhost:6866", "http://127.0.0.1:6866", "http://localhost:9527", "http://127.0.0.1:9527"})
 @RequestMapping("/api/boss")
 public class BossAnalyticsController {
 

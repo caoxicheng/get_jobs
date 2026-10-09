@@ -18,7 +18,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 @RestController
-@CrossOrigin(origins = "*")
+@CrossOrigin(origins = {"http://localhost:6866", "http://127.0.0.1:6866", "http://localhost:9527", "http://127.0.0.1:9527"})
 @RequestMapping("/api/boss/config")
 public class BossConfigController {
 

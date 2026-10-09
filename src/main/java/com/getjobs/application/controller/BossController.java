@@ -28,7 +28,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 @Slf4j
 @RestController
 @RequestMapping("/api/boss")
-@CrossOrigin(origins = "*")
+@CrossOrigin(origins = {"http://localhost:6866", "http://127.0.0.1:6866", "http://localhost:9527", "http://127.0.0.1:9527"})
 @RequiredArgsConstructor
 public class BossController {
     private static final ObjectMapper objectMapper = new ObjectMapper();
