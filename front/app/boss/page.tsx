@@ -32,6 +32,9 @@ interface BossConfig {
   sendImgResume?: number
   filterDeadHr?: number
   deadStatus?: string
+  // 期望薪资（K/月）。填 0 或留空表示不限制；两者都留空则不启用薪资过滤。
+  expectedSalaryMin?: number
+  expectedSalaryMax?: number
 }
 
 interface BossOption {
@@ -106,6 +109,33 @@ export default function BossPage() {
   const [saveResult, setSaveResult] = useState<{ success: boolean; message: string; title?: string } | null>(null)
   const [showLogoutResultDialog, setShowLogoutResultDialog] = useState(false)
   const [logoutResult, setLogoutResult] = useState<{ success: boolean; message: string } | null>(null)
+
+  // 投递状态以后端为准。
+  // isDelivering 原先只在点按钮时改，从不跟后端同步：页面一刷新它就变回 false，
+  // 于是按钮显示成「开始投递」——而任务其实还在后台跑，页面上再也找不到停止入口，
+  // 只能去杀进程。这里挂一个轻量轮询把状态拉回来，顺带解决任务自然结束后
+  // 按钮还停在「停止投递」的问题。
+  useEffect(() => {
+    let alive = true
+    const syncRunningState = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/boss/status`)
+        if (!res.ok) return
+        const data = await res.json()
+        if (alive && typeof data.isRunning === 'boolean') {
+          setIsDelivering(data.isRunning)
+        }
+      } catch {
+        // 后端没起来或临时不可达时忽略，不要打断页面
+      }
+    }
+    syncRunningState()
+    const timer = setInterval(syncRunningState, 3000)
+    return () => {
+      alive = false
+      clearInterval(timer)
+    }
+  }, [])
 
   useEffect(() => {
     fetchAllData()
@@ -323,6 +353,13 @@ export default function BossPage() {
         // HR活跃过滤开关：后端为 0/1，前端直接回显为数字
         const normalizedFilterDeadHr = (data.config?.filterDeadHr ?? 0)
         setConfig(prev => ({ ...prev, filterDeadHr: normalizedFilterDeadHr }))
+
+        // 期望薪资：null/0 一律回显为空，避免把 0 当有效值回填后误过滤全部岗位
+        setConfig(prev => ({
+          ...prev,
+          expectedSalaryMin: data.config?.expectedSalaryMin || undefined,
+          expectedSalaryMax: data.config?.expectedSalaryMax || undefined,
+        }))
 
         // 其它多选选项：将中文名称转换为代码以匹配 MultiSelect 的 selected
         setSelectedIndustry(toCodes(data.options.industry || [], parseListString(data.config?.industry)))
@@ -724,6 +761,40 @@ export default function BossPage() {
                   onChange={setSelectedExperience}
                   placeholder="选择工作经验"
                 />
+              </div>
+            </div>
+
+            {/* 期望薪资过滤：投递前逐个岗位比对，区间无交集就跳过（上限留空表示不限） */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6">
+              <div className="space-y-2">
+                <Label htmlFor="expectedSalaryMin">期望月薪下限（K）</Label>
+                <Input
+                  id="expectedSalaryMin"
+                  type="number"
+                  value={config.expectedSalaryMin ?? ''}
+                  onChange={(e) => setConfig({
+                    ...config,
+                    expectedSalaryMin: e.target.value === '' ? undefined : Number(e.target.value),
+                  })}
+                  placeholder="例如：17"
+                />
+                <p className="text-xs text-muted-foreground">填 17 就是 17K（填 17000 会按「元」自动换算，两者等价）</p>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="expectedSalaryMax">期望月薪上限（K）</Label>
+                <Input
+                  id="expectedSalaryMax"
+                  type="number"
+                  value={config.expectedSalaryMax ?? ''}
+                  onChange={(e) => setConfig({
+                    ...config,
+                    expectedSalaryMax: e.target.value === '' ? undefined : Number(e.target.value),
+                  })}
+                  placeholder="留空表示不限"
+                />
+                <p className="text-xs text-muted-foreground">
+                  留空或 0 = 不限上限。注意：填了上限会连「薪资高于该值」的岗位一起过滤掉。
+                </p>
               </div>
             </div>
           </CardContent>
