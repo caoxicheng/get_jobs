@@ -76,6 +76,26 @@ public class Boss {
     private static final double LOAD_STATE_TIMEOUT = 10_000;
 
     /**
+     * 岗位方向方向词：列表卡片的可见文本必须命中其中之一，才值得点进去投。
+     *
+     * <p>背景：Boss 在真实搜索结果翻到底之后，会在同一个 {@code ul.rec-job-list} 里
+     * 继续追加"相关推荐"岗位。实测在"前端开发"的搜索结果尾部混进来过：
+     * 高级java开发、硬件开发工程师、C#视觉开发工程师、数据开发工程师、C++开发工程师。
+     * 这些岗位与前端方向毫无关系，但结构上和真实结果一模一样，靠选择器分不出来。
+     *
+     * <p>所以这里在点击卡片之前先读卡片文本做一次粗筛：不命中就直接跳过，
+     * 不点击、不调 AI、不入库、不出现在进度里。命中之后再交给黑名单/薪资/AI 三道过滤。
+     *
+     * <p>关键是"宁可放过、不要误杀"：这份清单只放方向词，像「全栈」这种
+     * 既可能是前端全栈也可能是 Java 全栈的，放进来让后面的 AI 去判断，
+     * 免得把本该投的岗位挡掉。清单里的项都是小写，比较前会把卡片文本转小写。
+     */
+    private static final List<String> RELEVANT_CARD_WORDS = List.of(
+            "前端", "web", "h5", "react", "vue", "angular", "typescript", "javascript",
+            "小程序", "大前端", "node", "网页", "全栈"
+    );
+
+    /**
      * 进度回调接口
      */
     @FunctionalInterface
@@ -330,6 +350,21 @@ public class Boss {
 
                 // 重新获取卡片，避免元素过期
                 cards = page.locator("//ul[contains(@class, 'rec-job-list')]//li[contains(@class, 'job-card-box')]");
+
+                // 方向粗筛：先读卡片的可见文本，把搜索结果尾部追加的"相关推荐"岗位挡在点击之前。
+                // 放在这里而不是点开之后，是因为不点击就不会入库、不会调 AI、也不会出现在进度提示里。
+                try {
+                    String cardText = cards.nth(i).innerText();
+                    if (!isRelevantCard(cardText)) {
+                        log.info("被过滤：岗位方向不相关（疑似推荐岗位）| 卡片：{}",
+                                cardText.replaceAll("\\s+", " ").trim());
+                        continue;
+                    }
+                } catch (Throwable e) {
+                    // 读不到文本时不拦：宁可多处理一个，也不要因为一次读取失败误杀岗位
+                    log.debug("读取卡片文本失败，跳过方向粗筛：{}", e.getMessage());
+                }
+
                 // 在点击卡片时同步等待岗位详情接口返回，随后解析并入库
                 Response detailResp = null;
                 try {
@@ -432,6 +467,19 @@ public class Boss {
                     continue;
                 }
 
+                // 期望薪资过滤：岗位薪资区间与期望区间没有交集时跳过。
+                // 注意：isSalaryNotExpected 在这个版本里原本定义了却没有任何调用点，
+                // 也就是 README 说的"自动过滤目标薪资"实际从未生效（10-14K 的岗位照样投）。
+                if (isSalaryNotExpected(jobSalary)) {
+                    log.info("被过滤：薪资不符合期望 | 公司：{} | 岗位：{} | 薪资：{} | 期望：{}K-{}K",
+                            bossCompany != null ? bossCompany : "",
+                            jobName != null ? jobName : "",
+                            jobSalary != null ? jobSalary : "",
+                            toSalaryK(getMinimumSalary(config.getExpectedSalary())),
+                            toSalaryK(getMaximumSalary(config.getExpectedSalary())));
+                    continue;
+                }
+
                 // 创建Job对象（全部基于 JSON 字段）
                 Job job = new Job();
                 job.setJobName(jobName != null ? jobName : "");
@@ -441,9 +489,29 @@ public class Boss {
                 job.setRecruiter(bossName != null ? bossName : "");
                 job.setJobInfo(jobDesc != null ? jobDesc : "");
 
+                // AI 相关性判断：必须放在"点击立即沟通"之前！
+                //
+                // Boss 的机制是：只要点开对话，平台就会立刻自动发出你账号里预设的打招呼语。
+                // 所以一旦点下去，招呼就已经打出去了，之后再判"不匹配"根本来不及撤回。
+                // （之前这段判断放在 resumeSubmission 内部、chatBtn.click() 之后，
+                //   结果是 java/net/数据/硬件 这类推荐岗位照样被打招呼，只是没发第二条 AI 文案。）
+                // 现在前移到投递之前：不匹配就 continue，连对话都不点开。
+                String aiMessage = null;
+                if (Boolean.TRUE.equals(config.getEnableAI())) {
+                    String jd = job.getJobInfo();
+                    if (jd != null && !jd.isEmpty()) {
+                        aiMessage = generateAiMessage(keyword, job.getJobName(), jd);
+                        if (aiMessage == null) {
+                            log.info("跳过投递：AI判定与简历不匹配（未点开对话，Boss不会自动打招呼）| 公司：{} | 岗位：{}",
+                                    job.getCompanyName(), job.getJobName());
+                            continue;
+                        }
+                    }
+                }
+
                 // 输出
                 progressCallback.accept("正在投递：" + jobName, i + 1, count);
-                resumeSubmission(keyword, job);
+                resumeSubmission(keyword, job, aiMessage);
                 postCount++;
 
                 // 为避免点击下面的卡片触发页面刷新：在点击5个卡片之后，每次点击后适度下滑
@@ -995,7 +1063,7 @@ public class Boss {
      * 备注：目前Boss无法通过新标签页打开立即沟通按钮，所以只能点击更多详情，然后从更多详情里打开聊天按钮
      */
     @SneakyThrows
-    private void resumeSubmission(String keyword, Job job) {
+    private void resumeSubmission(String keyword, Job job, String aiMessage) {
         // 若收到停止指令，直接短路返回
         if (shouldStopCallback != null && Boolean.TRUE.equals(shouldStopCallback.get())) {
             log.info("停止指令已触发，跳过投递 | 公司：{} | 岗位：{}", job.getCompanyName(), job.getJobName());
@@ -1077,14 +1145,10 @@ public class Boss {
             return;
         }
 
-        // 5. AI智能生成打招呼语
-        String aiMessage = null;
-        if (config.getEnableAI()) {
-            String jd = job.getJobInfo();
-            if (jd != null && !jd.isEmpty()) {
-                aiMessage = generateAiMessage(keyword, job.getJobName(), jd);
-            }
-        }
+        // 5. 打招呼语：用调用方在"点开对话之前"就生成好的 AI 文案；
+        //    没有（未开 AI / JD 为空 / 生成失败）就用兜底话术。
+        //    注意：AI 判定不匹配的岗位已经在列表循环里 continue 掉了，不会走到这里，
+        //    所以这里不存在"明知不匹配还照样点开对话"的情况。
         String message = isValidString(aiMessage) ? aiMessage : config.getSayHi();
 
         // 6. 输入打招呼语
@@ -1321,6 +1385,18 @@ public class Boss {
     }
 
     /**
+     * 列表卡片方向粗筛：卡片可见文本命中任一方向词（见 RELEVANT_CARD_WORDS）即放行。
+     * 文本为空（读不到）时放行，宁可多处理一个，也不要误杀。
+     */
+    private boolean isRelevantCard(String cardText) {
+        if (cardText == null || cardText.isBlank()) {
+            return true;
+        }
+        String lower = cardText.toLowerCase();
+        return RELEVANT_CARD_WORDS.stream().anyMatch(lower::contains);
+    }
+
+    /**
      * 检查岗位薪资是否符合预期
      *
      * @return boolean
@@ -1352,11 +1428,11 @@ public class Boss {
             String jobType = detectJobType(salary);
             salary = removeDayUnitIfNeeded(salary); // 如果是按天，则去除 "元/天"
 
-            // 6. 解析薪资范围并检查是否超出预期
+            // 6. 解析薪资范围并检查是否超出预期（期望薪资统一换算成 K 再比较）
             Integer[] jobSalaryRange = parseSalaryRange(salary);
             return isSalaryOutOfRange(jobSalaryRange,
-                    getMinimumSalary(expectedSalary),
-                    getMaximumSalary(expectedSalary),
+                    toSalaryK(getMinimumSalary(expectedSalary)),
+                    toSalaryK(getMaximumSalary(expectedSalary)),
                     jobType);
 
         } catch (Exception e) {
@@ -1368,10 +1444,33 @@ public class Boss {
     }
 
     /**
-     * 是否存在有效的期望薪资范围
+     * 是否存在有效的期望薪资范围。
+     *
+     * 必须要求下限为正数：数据库里 min/max 都可能是 0（表示"没填"），
+     * 若把 [0,0] 当成有效范围，则"岗位下限 > 期望上限"对所有岗位都成立，
+     * 会把整轮投递全部过滤掉。
      */
     private boolean hasExpectedSalary(List<Integer> expectedSalary) {
-        return expectedSalary != null && !expectedSalary.isEmpty();
+        if (expectedSalary == null || expectedSalary.isEmpty()) {
+            return false;
+        }
+        Integer min = getMinimumSalary(expectedSalary);
+        return min != null && min > 0;
+    }
+
+    /**
+     * 把期望薪资统一换算成「K」（千元）。
+     *
+     * 岗位薪资文本（如 "10-14K"）经 parseSalaryRange 解析出来就是 K 值，
+     * 两边必须同单位才能比较。而配置里的期望薪资既可能被填成 17（K）
+     * 也可能被填成 17000（元）——单位不一致时所有岗位都会被判成"给得太少"。
+     * 这里统一处理：>= 1000 的按「元」看待，除以 1000 换成 K；<= 0 视为未配置。
+     */
+    private Integer toSalaryK(Integer value) {
+        if (value == null || value <= 0) {
+            return null;
+        }
+        return value >= 1000 ? Math.round(value / 1000f) : value;
     }
 
     /**
@@ -1428,25 +1527,32 @@ public class Boss {
 
     private boolean isSalaryOutOfRange(Integer[] jobSalary, Integer miniSalary, Integer maxSalary,
                                        String jobType) {
-        if (jobSalary == null) {
+        if (jobSalary == null || jobSalary.length == 0) {
             return true;
         }
         if (miniSalary == null) {
             return false;
         }
+        // 有些薪资文本只解析出一个数（例如日薪 "200元/天" -> [200]），
+        // 缺失的那一端用同一个值兜底，否则 jobSalary[1] 抛数组越界被上层 catch 吞掉，
+        // 结果是所有日薪岗位被静默过滤。
+        int jobMin = jobSalary[0];
+        int jobMax = jobSalary.length > 1 ? jobSalary[1] : jobSalary[0];
         if (Objects.equals("day", jobType)) {
-            // 期望薪资转为平均每日的工资
-            maxSalary = BigDecimal.valueOf(maxSalary).multiply(BigDecimal.valueOf(1000))
-                    .divide(BigDecimal.valueOf(21.75), 0, RoundingMode.HALF_UP).intValue();
+            // 期望薪资（K/月）转为平均每日的工资（元/天）
             miniSalary = BigDecimal.valueOf(miniSalary).multiply(BigDecimal.valueOf(1000))
                     .divide(BigDecimal.valueOf(21.75), 0, RoundingMode.HALF_UP).intValue();
+            if (maxSalary != null) {
+                maxSalary = BigDecimal.valueOf(maxSalary).multiply(BigDecimal.valueOf(1000))
+                        .divide(BigDecimal.valueOf(21.75), 0, RoundingMode.HALF_UP).intValue();
+            }
         }
-        // 如果职位薪资下限低于期望的最低薪资，返回不符合
-        if (jobSalary[1] < miniSalary) {
+        // 岗位薪资的上限都低于期望下限 → 给得太少
+        if (jobMax < miniSalary) {
             return true;
         }
-        // 如果职位薪资上限高于期望的最高薪资，返回不符合
-        return maxSalary != null && jobSalary[0] > maxSalary;
+        // 岗位薪资的下限就高于期望上限 → 超出预期（maxSalary 为空表示不限上限）
+        return maxSalary != null && jobMin > maxSalary;
     }
 
     public boolean containsDeadStatus(String activeTimeText, List<String> deadStatus) {
@@ -1472,7 +1578,13 @@ public class Boss {
             if (result == null) {
                 return config.getSayHi();
             }
-            return result.toLowerCase().contains("false") ? config.getSayHi() : result;
+            // AI 明确判定"不匹配"（提示词里约定这种情况只输出 false）→ 返回 null，
+            // 由调用方跳过该岗位。其它情况（含请求异常）一律退回默认招呼语，
+            // 避免因为 AI 抖动把本该投的岗位丢掉。
+            if (result.trim().toLowerCase().startsWith("false")) {
+                return null;
+            }
+            return result;
         } catch (Exception e) {
             log.warn("AI请求失败，使用原有打招呼语: {}", e.getMessage());
             return config.getSayHi();
